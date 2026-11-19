@@ -217,11 +217,15 @@ namespace DacDeck
         public byte[] Get(byte cmd, params byte[] data)
         {
             if (!Send(FiioProtocol.Frame(false, cmd, data))) return null;
-            var deadline = DateTime.UtcNow.AddMilliseconds(1000);
+            var deadline = DateTime.UtcNow.AddMilliseconds(600); // replies come within a few ms
             while (DateTime.UtcNow < deadline)
             {
-                var r = _port.Read(300);
-                if (r == null) continue;
+                var r = _port.Read(200);
+                if (r == null)
+                {
+                    if (_port.Broken) return null; // a hard error repeats at once: never spin on it
+                    continue;
+                }
                 byte[] payload;
                 bool mine = FiioProtocol.TryParseReply(r, cmd, out payload);
                 if (Trace != null) Trace("RX " + FiioProtocol.Hex(r, Math.Min(r.Length, 24)) + (mine ? "" : "  (other report, skipped)"));
@@ -256,9 +260,11 @@ namespace DacDeck
             return back.HasValue && Math.Abs(back.Value - db) < 1.0; // some firmwares keep whole dB only
         }
 
-        public bool SetBand(EqBand b)
+        // verify = read the band back and compare (slower: one more round trip)
+        public bool SetBand(EqBand b, bool verify)
         {
             if (!Set(FiioProtocol.CmdBand, FiioProtocol.EncodeBand(b, Model))) return false;
+            if (!verify) return true;
             var back = Band(b.Index);
             if (back == null) return false;
             var want = FiioProtocol.DecodeBand(FiioProtocol.EncodeBand(b, Model)); // what the device can hold

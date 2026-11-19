@@ -413,48 +413,81 @@ namespace DacDeck
 
         private EqBand[] CurrentBands() { return _state.Bands.Select(b => b.Clone()).ToArray(); }
 
+        // Bands edited here in the last moments win over incoming device state (it may still be catching up)
+        private readonly Dictionary<int, DateTime> _editedAt = new Dictionary<int, DateTime>();
+        private static readonly TimeSpan LocalEditHold = TimeSpan.FromMilliseconds(1500);
+        private string _presetSig, _copySig;
+        private DateTime _errorUntil = DateTime.MinValue;
+
         public void ApplyState(EqState s)
         {
-            if (!string.IsNullOrEmpty(s.Error)) _status.Text = "⚠ " + s.Error;
+            var now = DateTime.UtcNow;
+            if (s.Connected && _state.Connected && s.Preset == _state.Preset && s.Bands.Length == _state.Bands.Length)
+                foreach (var kv in _editedAt)
+                    if (now - kv.Value < LocalEditHold && kv.Key < s.Bands.Length) s.Bands[kv.Key] = _state.Bands[kv.Key].Clone();
+            if (s.Preset != _state.Preset) _editedAt.Clear();
+
             _state = s;
             _updating = true;
+            SuspendLayout();
             try
             {
                 bool on = s.Connected && s.Model != null;
-                _device.Text = on ? s.Model.Name : "Chưa cắm DAC";
-                if (string.IsNullOrEmpty(s.Error))
-                    _status.Text = on ? ("Firmware " + (s.Firmware ?? "?") + (s.Dirty ? "  ·  có thay đổi chưa lưu" : "")) : "Cắm SNOWSKY Melody (hoặc DAC FiiO) bằng cáp USB.";
-                _status.ForeColor = !string.IsNullOrEmpty(s.Error) ? Theme.Danger : (s.Dirty ? Theme.AccentWarm : Theme.TextDim);
+                SetText(_device, on ? s.Model.Name : "Chưa cắm DAC");
+                string status = !string.IsNullOrEmpty(s.Error) ? "⚠ " + s.Error
+                    : on ? ("Firmware " + (s.Firmware ?? "?") + (s.Loading ? "  ·  đang đọc EQ…" : "") + (s.Dirty ? "  ·  có thay đổi chưa lưu" : ""))
+                    : "Cắm SNOWSKY Melody (hoặc DAC FiiO) bằng cáp USB.";
+                bool error = !string.IsNullOrEmpty(s.Error);
+                if (error) _errorUntil = now.AddSeconds(5); // keep a write error readable for a few seconds
+                if (error || now >= _errorUntil || !on)
+                {
+                    SetText(_status, status);
+                    _status.ForeColor = error ? Theme.Danger : (s.Dirty ? Theme.AccentWarm : Theme.TextDim);
+                }
 
-                _preset.Items.Clear();
-                _copyTarget.Items.Clear();
+                // Preset lists: rebuilt only when they change, not on every update
+                var presetItems = new List<PresetItem>();
+                var copyItems = new List<PresetItem>();
                 if (on)
                 {
-                    foreach (var p in s.Model.Presets) _preset.Items.Add(new PresetItem { Id = p.Id, Name = p.Name });
-                    if (s.Model.OffPresetId >= 0) _preset.Items.Add(new PresetItem { Id = s.Model.OffPresetId, Name = "Tắt EQ" });
-                    if (!_preset.Items.Cast<PresetItem>().Any(i => i.Id == s.Preset) && s.Preset >= 0)
-                        _preset.Items.Add(new PresetItem { Id = s.Preset, Name = s.Model.PresetName(s.Preset) });
-                    _preset.SelectedItem = _preset.Items.Cast<PresetItem>().FirstOrDefault(i => i.Id == s.Preset);
-                    foreach (var p in s.Model.Presets.Where(p => p.Writable && p.Id != s.Preset)) _copyTarget.Items.Add(new PresetItem { Id = p.Id, Name = p.Name });
+                    presetItems.AddRange(s.Model.Presets.Select(p => new PresetItem { Id = p.Id, Name = p.Name }));
+                    if (s.Model.OffPresetId >= 0) presetItems.Add(new PresetItem { Id = s.Model.OffPresetId, Name = "Tắt EQ" });
+                    if (s.Preset >= 0 && !presetItems.Any(i => i.Id == s.Preset)) presetItems.Add(new PresetItem { Id = s.Preset, Name = s.Model.PresetName(s.Preset) });
+                    copyItems.AddRange(s.Model.Presets.Where(p => p.Writable && p.Id != s.Preset).Select(p => new PresetItem { Id = p.Id, Name = p.Name }));
+                }
+                string psig = string.Join("|", presetItems.Select(i => i.Id + i.Name).ToArray());
+                if (psig != _presetSig) { _presetSig = psig; _preset.Items.Clear(); _preset.Items.AddRange(presetItems.Cast<object>().ToArray()); }
+                var sel = _preset.Items.Cast<PresetItem>().FirstOrDefault(i => i.Id == s.Preset);
+                if (_preset.SelectedItem != sel) _preset.SelectedItem = sel;
+                string csig = string.Join("|", copyItems.Select(i => i.Id.ToString()).ToArray());
+                if (csig != _copySig)
+                {
+                    _copySig = csig;
+                    _copyTarget.Items.Clear();
+                    _copyTarget.Items.AddRange(copyItems.Cast<object>().ToArray());
                     if (_copyTarget.Items.Count > 0) _copyTarget.SelectedIndex = 0;
                 }
 
-                _gain.Value = (int)Math.Max(_gain.Minimum, Math.Min(_gain.Maximum, Math.Round(s.GlobalGain)));
-                _gainValue.Text = on ? FormatDb(s.GlobalGain) : "";
+                if (!_gainDebounce.Enabled) // not while the user is moving the slider
+                {
+                    int gv = (int)Math.Max(_gain.Minimum, Math.Min(_gain.Maximum, Math.Round(s.GlobalGain)));
+                    if (_gain.Value != gv) _gain.Value = gv;
+                    SetText(_gainValue, on ? FormatDb(s.GlobalGain) : "");
+                }
 
                 bool edit = Editable;
                 for (int i = 0; i < _rows.Count; i++)
                 {
                     var row = _rows[i];
                     var b = i < s.Bands.Length ? s.Bands[i] : null;
-                    bool has = b != null;
-                    row.Type.Enabled = row.Freq.Enabled = row.Gain.Enabled = row.Q.Enabled = has && edit;
+                    bool has = b != null, en = has && edit;
+                    if (row.Freq.Enabled != en) row.Type.Enabled = row.Freq.Enabled = row.Gain.Enabled = row.Q.Enabled = en;
                     row.Num.Enabled = has;
                     if (!has) continue;
-                    row.Type.SelectedIndex = (int)b.Type;
-                    row.Freq.Value = Math.Max(row.Freq.Minimum, Math.Min(row.Freq.Maximum, b.FreqHz));
-                    row.Gain.Value = Math.Max(row.Gain.Minimum, Math.Min(row.Gain.Maximum, (decimal)b.GainDb));
-                    row.Q.Value = Math.Max(row.Q.Minimum, Math.Min(row.Q.Maximum, (decimal)b.Q));
+                    if (row.Type.SelectedIndex != (int)b.Type) row.Type.SelectedIndex = (int)b.Type;
+                    SetNum(row.Freq, b.FreqHz);
+                    SetNum(row.Gain, (decimal)b.GainDb);
+                    SetNum(row.Q, (decimal)b.Q);
                 }
                 _graph.SetData(s.Bands, s.GlobalGain, edit, s.Model);
 
@@ -463,11 +496,23 @@ namespace DacDeck
                 _flat.Enabled = edit;
                 _save.Enabled = edit;
                 _copy.Enabled = _copyTarget.Enabled = on && _copyTarget.Items.Count > 0;
-                _hint.Text = on && !edit
+                SetText(_hint, on && !edit
                     ? (s.Preset == s.Model.OffPresetId ? "EQ đang tắt. Chọn một preset để bật." : "Preset có sẵn chỉ xem được. Chọn USER1–3 để chỉnh, hoặc chép EQ này sang một slot USER.")
-                    : (on ? "Kéo các điểm trên đồ thị để chỉnh tần số và gain, lăn chuột để đổi Q. Thay đổi phát ngay; bấm \"Lưu vào thiết bị\" để giữ lại." : "");
+                    : (on ? "Kéo các điểm trên đồ thị để chỉnh tần số và gain, lăn chuột để đổi Q. Thay đổi phát ngay; bấm \"Lưu vào thiết bị\" để giữ lại." : ""));
             }
-            finally { _updating = false; }
+            finally
+            {
+                ResumeLayout();
+                _updating = false;
+            }
+        }
+
+        private static void SetText(Control c, string text) { if (c.Text != text) c.Text = text; }
+
+        private static void SetNum(NumericUpDown n, decimal v)
+        {
+            v = Math.Max(n.Minimum, Math.Min(n.Maximum, Math.Round(v, n.DecimalPlaces)));
+            if (n.Value != v) n.Value = v;
         }
 
         private void HighlightRow(int index)
@@ -492,6 +537,7 @@ namespace DacDeck
         {
             if (!Editable || b.Index >= _state.Bands.Length) return;
             _state.Bands[b.Index] = b.Clone();
+            _editedAt[b.Index] = DateTime.UtcNow;
             _state.Dirty = true;
             if (fromGraph)
             {
@@ -499,15 +545,18 @@ namespace DacDeck
                 try
                 {
                     var row = _rows[b.Index];
-                    row.Freq.Value = Math.Max(row.Freq.Minimum, Math.Min(row.Freq.Maximum, b.FreqHz));
-                    row.Gain.Value = Math.Max(row.Gain.Minimum, Math.Min(row.Gain.Maximum, (decimal)b.GainDb));
-                    row.Q.Value = Math.Max(row.Q.Minimum, Math.Min(row.Q.Maximum, (decimal)b.Q));
+                    SetNum(row.Freq, b.FreqHz);
+                    SetNum(row.Gain, (decimal)b.GainDb);
+                    SetNum(row.Q, (decimal)b.Q);
                 }
                 finally { _updating = false; }
             }
             else _graph.SetData(_state.Bands, _gain.Value, true, _state.Model);
-            _status.Text = "Firmware " + (_state.Firmware ?? "?") + "  ·  có thay đổi chưa lưu";
-            _status.ForeColor = Theme.AccentWarm;
+            if (DateTime.UtcNow >= _errorUntil)
+            {
+                SetText(_status, "Firmware " + (_state.Firmware ?? "?") + "  ·  có thay đổi chưa lưu");
+                _status.ForeColor = Theme.AccentWarm;
+            }
             _svc.SetBand(b);
         }
 

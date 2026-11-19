@@ -134,9 +134,10 @@ namespace DacDeck
             _ov = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(NativeOverlapped)));
         }
 
-        private bool Io(bool write, int len, uint timeoutMs, out int done)
+        private bool Io(bool write, int len, uint timeoutMs, out int done, out bool timedOut)
         {
             done = 0;
+            timedOut = false;
             _ev.Reset();
             Marshal.StructureToPtr(new NativeOverlapped { EventHandle = _ev.SafeWaitHandle.DangerousGetHandle() }, _ov, false);
             uint n;
@@ -148,6 +149,7 @@ namespace DacDeck
                 {
                     CancelIoEx(_h, _ov);
                     GetOverlappedResult(_h, _ov, out n, true); // wait until Windows is done with _buf / _ov
+                    timedOut = true;
                     return false;
                 }
                 if (!GetOverlappedResult(_h, _ov, out n, false)) return false;
@@ -163,14 +165,20 @@ namespace DacDeck
             Array.Copy(report, buf, Math.Min(report.Length, OutLen));
             Marshal.Copy(buf, 0, _buf, OutLen);
             int n;
-            return Io(true, OutLen, timeoutMs, out n);
+            bool timedOut;
+            return Io(true, OutLen, timeoutMs, out n, out timedOut);
         }
 
-        // Next input report (report id first), or null on timeout
+        // Set when the last read failed outright (device gone, interface not readable) rather than timing out
+        public bool Broken { get; private set; }
+
+        // Next input report (report id first), or null on timeout / failure (see Broken)
         public byte[] Read(uint timeoutMs)
         {
             int n;
-            if (!Io(false, InLen, timeoutMs, out n) || n <= 0) return null;
+            bool timedOut;
+            if (!Io(false, InLen, timeoutMs, out n, out timedOut) || n <= 0) { Broken = !timedOut; return null; }
+            Broken = false;
             var r = new byte[n];
             Marshal.Copy(_buf, r, 0, n);
             return r;

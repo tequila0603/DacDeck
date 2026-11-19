@@ -1,6 +1,10 @@
-// Owns the DAC connection on one background thread. The UI posts requests (refresh, select preset, set gain,
-// set band, save, apply a whole profile); band edits for the same band are coalesced, so dragging a handle
-// sends only the latest value. State changes come back through StateChanged on the UI thread.
+// Owns the DAC connection on one background thread. The UI posts requests; state comes back through
+// StateChanged on the UI thread. Kept responsive on purpose:
+//  - band edits are coalesced per band and written without waiting for a read-back, so dragging a handle is
+//    heard right away; the written bands are read back once the edits pause (and before saving);
+//  - preset / gain requests are coalesced (only the latest one runs) and shown at once, from a per-preset
+//    cache when there is one, while the DAC is read in the background band by band;
+//  - with no DAC connected the HID list is only rescanned on a device change (or every 15 s as a fallback).
 // Note: C# 5 only (built with the .NET Framework csc), so no string interpolation / ?. / expression bodies.
 using System;
 using System.Collections.Generic;
@@ -17,8 +21,9 @@ namespace DacDeck
         public int Preset = -1;
         public double GlobalGain;
         public EqBand[] Bands = new EqBand[0];
-        public bool Dirty;   // edited since the last save to the device
-        public string Error; // a write the device did not take (sent once, with the state right after it)
+        public bool Dirty;    // edited since the last save to the device
+        public bool Loading;  // bands still being read from the DAC
+        public string Error;  // a write the device did not take (sent once, with the state right after it)
 
         public EqState Copy()
         {
@@ -33,12 +38,19 @@ namespace DacDeck
         public event Action<EqState> StateChanged;   // raised on the UI thread
         public event Action<string, string> Notify;  // (title, subtitle) for a popup, UI thread
 
+        private static readonly TimeSpan VerifyAfter = TimeSpan.FromMilliseconds(700);
+
         private readonly SynchronizationContext _ui;
         private readonly Thread _thread;
         private readonly AutoResetEvent _wake = new AutoResetEvent(false);
         private readonly object _lock = new object();
         private readonly Queue<Action<FiioDevice>> _jobs = new Queue<Action<FiioDevice>>();
         private readonly Dictionary<int, EqBand> _pendingBands = new Dictionary<int, EqBand>();
+        private readonly Dictionary<int, EqBand> _unverified = new Dictionary<int, EqBand>();   // written, not read back yet
+        private readonly Dictionary<int, EqState> _cache = new Dictionary<int, EqState>();       // last reading per preset
+        private int? _pendingPreset;
+        private double? _pendingGain;
+        private DateTime _lastBandWrite = DateTime.MinValue;
         private volatile bool _stop, _rescan = true;
         private FiioDevice _dev;
         private EqState _state = new EqState();
@@ -55,27 +67,43 @@ namespace DacDeck
         // ------------------------------------------------------------------ requests (any thread)
 
         public void Rescan() { _rescan = true; _wake.Set(); }
-        public void Refresh() { Enqueue(delegate(FiioDevice d) { ReadAll(d); }); }
+        public void Refresh() { Enqueue(delegate(FiioDevice d) { ReadEq(d, true); }); }
 
+        // Shown at once (cached bands when known); the DAC is switched and read in the background
         public void SelectPreset(int id)
         {
-            Enqueue(delegate(FiioDevice d)
+            EqState snap;
+            lock (_lock)
             {
-                if (!d.SetPreset(id)) Fail("Thiết bị không nhận preset " + d.Model.PresetName(id));
-                ReadAll(d);
-                Raise(Notify, "EQ · " + d.Model.PresetName(id), d.Model.Name);
-            });
+                if (!_state.Connected) return;
+                _pendingPreset = id;
+                _pendingBands.Clear();
+                _state.Preset = id;
+                _state.Dirty = false;
+                EqState cached;
+                if (_cache.TryGetValue(id, out cached)) { _state.Bands = cached.Bands.Select(b => b.Clone()).ToArray(); _state.GlobalGain = cached.GlobalGain; }
+                _state.Loading = true;
+                snap = _state.Copy();
+            }
+            Raise(snap);
+            Raise(Notify, "EQ · " + snap.Model.PresetName(id), snap.Model.Name);
+            _wake.Set();
         }
 
         public void SetGlobalGain(double db, bool notify)
         {
-            Enqueue(delegate(FiioDevice d)
+            EqState snap;
+            lock (_lock)
             {
-                if (!d.SetGlobalGain(db)) Fail("Thiết bị không nhận gain tổng " + db.ToString("+0;-0;0") + " dB");
-                var g = d.GlobalGain();
-                Update(delegate(EqState s) { if (g.HasValue) s.GlobalGain = g.Value; s.Dirty = true; });
-                if (notify) Raise(Notify, "Gain tổng · " + (g ?? db).ToString("+0;-0;0") + " dB", d.Model.Name);
-            });
+                if (!_state.Connected) return;
+                _pendingGain = db;
+                _state.GlobalGain = db;
+                _state.Dirty = true;
+                snap = _state.Copy();
+            }
+            Raise(snap);
+            if (notify) Raise(Notify, "Gain tổng · " + db.ToString("+0;-0;0") + " dB", snap.Model.Name);
+            _wake.Set();
         }
 
         public void SetBand(EqBand b)
@@ -92,34 +120,35 @@ namespace DacDeck
         {
             Enqueue(delegate(FiioDevice d)
             {
+                FlushEdits(d);
+                if (!VerifyWritten(d)) return; // something did not stick: do not store it
                 var preset = d.Preset();
                 if (!preset.HasValue) { Fail("Không đọc được preset hiện tại"); return; }
                 var p = d.Model.Preset(preset.Value);
                 if (p == null || !p.Writable) { Fail("Chỉ lưu được vào USER1–3. Hãy chọn một slot USER."); return; }
                 if (!d.Save(preset.Value)) { Fail("Lưu thất bại"); return; }
                 Update(delegate(EqState s) { s.Dirty = false; });
+                CacheCurrent();
                 Raise(Notify, "Đã lưu vào " + p.Name, d.Model.Name);
             });
         }
 
-        // Switches to `presetId` (a USER slot), writes gain + every band, saves
+        // Switches to `presetId` (a USER slot), writes gain + every band, checks them, saves
         public void ApplyProfile(int presetId, double globalGain, IList<EqBand> bands, string label)
         {
             var copy = bands.Select(b => b.Clone()).ToList();
             Enqueue(delegate(FiioDevice d)
             {
-                lock (_lock) _pendingBands.Clear();
+                lock (_lock) { _pendingBands.Clear(); _pendingPreset = null; _pendingGain = null; }
                 int failed = 0;
                 if (!d.SetPreset(presetId)) failed++;
                 if (!d.SetGlobalGain(globalGain)) failed++;
-                foreach (var b in copy) if (!d.SetBand(b)) failed++;
+                foreach (var b in copy) if (!d.SetBand(b, true)) failed++;
                 if (failed == 0 && d.Save(presetId))
-                {
-                    Update(delegate(EqState s) { s.Dirty = false; });
                     Raise(Notify, label + " → " + d.Model.PresetName(presetId), d.Model.Name);
-                }
-                else Fail(string.Format("{0} lệnh không được thiết bị nhận, chưa lưu.", failed));
-                ReadAll(d);
+                else
+                    Fail(string.Format("{0} lệnh không được thiết bị nhận, chưa lưu.", failed));
+                ReadEq(d, false);
             });
         }
 
@@ -137,36 +166,14 @@ namespace DacDeck
             {
                 try
                 {
-                    if (_rescan)
-                    {
-                        _rescan = false;
-                        Reconnect();
-                    }
-                    Action<FiioDevice> job = null;
-                    EqBand band = null;
-                    lock (_lock)
-                    {
-                        if (_jobs.Count > 0) job = _jobs.Dequeue();
-                        else if (_pendingBands.Count > 0)
-                        {
-                            int k = _pendingBands.Keys.First();
-                            band = _pendingBands[k];
-                            _pendingBands.Remove(k);
-                        }
-                    }
+                    if (_rescan) { _rescan = false; Reconnect(); }
                     if (_dev == null)
                     {
-                        if (job != null || band != null) { lock (_lock) { _jobs.Clear(); _pendingBands.Clear(); } }
-                        _wake.WaitOne(3000);
-                        _rescan = true;
+                        lock (_lock) { _jobs.Clear(); _pendingBands.Clear(); _pendingPreset = null; _pendingGain = null; }
+                        if (!_wake.WaitOne(15000)) _rescan = true; // plug-ins arrive through Rescan(); this is a fallback
                         continue;
                     }
-                    if (job != null) job(_dev);
-                    else if (band != null)
-                    {
-                        if (!_dev.SetBand(band)) Fail("Thiết bị không nhận band " + (band.Index + 1) + " (preset hiện tại có thể chỉ đọc).");
-                    }
-                    else _wake.WaitOne(5000);
+                    if (!Step(_dev)) _wake.WaitOne(_unverified.Count > 0 ? 250 : 5000);
                 }
                 catch (Exception ex)
                 {
@@ -178,15 +185,91 @@ namespace DacDeck
             Disconnect();
         }
 
+        // One unit of work, most urgent first. Returns false when there was nothing to do.
+        private bool Step(FiioDevice d)
+        {
+            Action<FiioDevice> job = null;
+            int? preset = null;
+            double? gain = null;
+            EqBand band = null;
+            lock (_lock)
+            {
+                if (_pendingPreset.HasValue) { preset = _pendingPreset; _pendingPreset = null; }
+                else if (_pendingBands.Count > 0) { int k = _pendingBands.Keys.First(); band = _pendingBands[k]; _pendingBands.Remove(k); }
+                else if (_pendingGain.HasValue) { gain = _pendingGain; _pendingGain = null; }
+                else if (_jobs.Count > 0) job = _jobs.Dequeue();
+            }
+            if (preset.HasValue)
+            {
+                lock (_lock) _unverified.Clear();
+                if (!d.SetPreset(preset.Value)) Fail("Thiết bị không nhận preset " + d.Model.PresetName(preset.Value));
+                ReadEq(d, false);
+                return true;
+            }
+            if (band != null)
+            {
+                if (!d.SetBand(band, false)) Fail("Không gửi được band " + (band.Index + 1) + " tới DAC.");
+                lock (_lock) { _unverified[band.Index] = band; _lastBandWrite = DateTime.UtcNow; }
+                return true;
+            }
+            if (gain.HasValue)
+            {
+                if (!d.SetGlobalGain(gain.Value)) Fail("Thiết bị không nhận gain tổng " + gain.Value.ToString("+0;-0;0") + " dB");
+                return true;
+            }
+            if (job != null) { job(d); return true; }
+            bool due;
+            lock (_lock) due = _unverified.Count > 0 && DateTime.UtcNow - _lastBandWrite >= VerifyAfter;
+            if (due) { VerifyWritten(d); return true; }
+            return false;
+        }
+
+        // Writes what is still queued (before a save)
+        private void FlushEdits(FiioDevice d)
+        {
+            while (true)
+            {
+                EqBand band = null; double? gain = null;
+                lock (_lock)
+                {
+                    if (_pendingBands.Count > 0) { int k = _pendingBands.Keys.First(); band = _pendingBands[k]; _pendingBands.Remove(k); }
+                    else if (_pendingGain.HasValue) { gain = _pendingGain; _pendingGain = null; }
+                }
+                if (band != null) { d.SetBand(band, false); lock (_lock) _unverified[band.Index] = band; }
+                else if (gain.HasValue) d.SetGlobalGain(gain.Value);
+                else return;
+            }
+        }
+
+        // Reads back the bands written without verification; reports (and shows) any the DAC did not take
+        private bool VerifyWritten(FiioDevice d)
+        {
+            List<EqBand> check;
+            lock (_lock) { check = _unverified.Values.ToList(); _unverified.Clear(); }
+            var bad = new List<int>();
+            foreach (var b in check)
+            {
+                var back = d.Band(b.Index);
+                if (back == null || !FiioProtocol.DecodeBand(FiioProtocol.EncodeBand(b, d.Model)).SameAs(back))
+                {
+                    bad.Add(b.Index + 1);
+                    if (back != null) Update(delegate(EqState s) { if (s.Bands.Length > back.Index) s.Bands[back.Index] = back; });
+                }
+            }
+            if (bad.Count > 0) Fail("DAC không giữ band " + string.Join(", ", bad.Select(i => i.ToString()).ToArray()) + " (preset này có thể chỉ đọc).");
+            return bad.Count == 0;
+        }
+
         private void Reconnect()
         {
             var all = Hid.Enumerate();
             if (_dev != null && all.Any(e => e.Path == _dev.Entry.Path)) return; // still there
             Disconnect();
             _dev = FiioDevice.Connect(all, null);
-            if (_dev == null) { Publish(new EqState()); return; }
+            if (_dev == null) return;
             Log.Info("Connected: " + _dev.Model.Name + " (" + _dev.Entry.Pid.ToString("X4") + ")");
-            ReadAll(_dev);
+            lock (_lock) _cache.Clear();
+            ReadEq(_dev, true);
             Raise(Notify, "Đã kết nối " + _dev.Model.Name, "DacDeck");
         }
 
@@ -195,21 +278,39 @@ namespace DacDeck
             if (_dev == null) return;
             try { _dev.Dispose(); } catch { }
             _dev = null;
+            lock (_lock) _unverified.Clear();
             Publish(new EqState());
         }
 
-        private void ReadAll(FiioDevice d)
+        // Preset and gain first (shown at once), then the bands one by one
+        private void ReadEq(FiioDevice d, bool full)
         {
-            var s = new EqState { Connected = true, Model = d.Model };
-            s.Firmware = d.Firmware();
+            EqState s;
+            lock (_lock) s = _state.Copy();
+            s.Connected = true;
+            s.Model = d.Model;
+            if (full || s.Firmware == null) s.Firmware = d.Firmware();
             s.Preset = d.Preset() ?? -1;
             s.GlobalGain = d.GlobalGain() ?? 0;
-            int n = d.BandCount() ?? d.Model.Bands;
-            var bands = new List<EqBand>();
-            for (int i = 0; i < n; i++)
-                bands.Add(d.Band(i) ?? new EqBand { Index = i, FreqHz = AutoEq.DefaultFreq(i, n), Q = 1 });
-            s.Bands = bands.ToArray();
+            int n = s.Bands.Length > 0 && !full ? s.Bands.Length : (d.BandCount() ?? d.Model.Bands);
+            if (s.Bands.Length != n)
+                s.Bands = Enumerable.Range(0, n).Select(i => new EqBand { Index = i, FreqHz = AutoEq.DefaultFreq(i, n), Q = 1 }).ToArray();
+            s.Loading = true;
+            s.Dirty = false;
             Publish(s);
+            for (int i = 0; i < n; i++)
+            {
+                lock (_lock) if (_pendingPreset.HasValue) return; // the user already picked another preset
+                var b = d.Band(i);
+                if (b != null) Update(delegate(EqState st) { if (st.Bands.Length > b.Index) st.Bands[b.Index] = b; });
+            }
+            Update(delegate(EqState st) { st.Loading = false; });
+            CacheCurrent();
+        }
+
+        private void CacheCurrent()
+        {
+            lock (_lock) if (_state.Preset >= 0) _cache[_state.Preset] = _state.Copy();
         }
 
         private void Fail(string msg)
